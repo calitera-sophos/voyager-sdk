@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 import urllib
 
 import cv2
+import av
+import numpy as np
 
 from axelera import types
 
@@ -718,6 +720,7 @@ class _OutputMode(enum.Enum):
     NONE = enum.auto()
     VIDEO = enum.auto()
     IMAGES = enum.auto()
+    RTMP = enum.auto()
 
 
 def _resolve_output_index(pattern: Path, index: int):
@@ -727,6 +730,10 @@ def _resolve_output_index(pattern: Path, index: int):
 def _determine_output_mode(location: str):
     if not location:
         return _OutputMode.NONE, location
+
+    # Check for RTMP URL
+    if location.startswith('rtmp://'):
+        return _OutputMode.RTMP, location
 
     path = Path(location)
     if location.endswith('/') or path.is_dir():
@@ -782,6 +789,126 @@ class _ImageWriter(_NullWriter):
         self._index += 1
 
 
+class RTMPStreamManager:
+    def __init__(self, rtmp_url):
+        self.rtmp_url = rtmp_url
+        self.output = None
+        self.stream = None
+        self.connected = False
+        
+    def connect(self, width, height, fps):
+        if self.connected:
+            return
+            
+        try:
+            LOG.info(f"Connecting to RTMP server at {self.rtmp_url}")
+            
+            # Create output container with explicit format
+            self.output = av.open(
+                self.rtmp_url,
+                mode='w',
+                format='flv',  # Explicitly specify FLV format for RTMP
+                options={
+                    'rtmp_live': 'live',
+                    'rtmp_buffer_size': '4096',
+                    'rtmp_timeout': '5',
+                    'flvflags': 'no_duration_filesize'
+                }
+            )
+            
+            # Create video stream with more conservative settings
+            self.stream = self.output.add_stream('h264', rate=fps)
+            self.stream.width = width
+            self.stream.height = height
+            self.stream.pix_fmt = 'yuv420p'
+            self.stream.options = {
+                'preset': 'ultrafast',
+                'tune': 'zerolatency',
+                'profile': 'baseline',
+                'level': '3.0',
+                'x264opts': 'no-scenecut'
+            }
+            
+            # Set codec parameters
+            self.stream.codec_context.bit_rate = 2500000  # 2.5 Mbps
+            self.stream.codec_context.gop_size = 30
+            self.stream.codec_context.max_b_frames = 0
+            
+            self.connected = True
+            LOG.info("Successfully connected to RTMP server")
+            
+        except Exception as e:
+            LOG.error(f"Failed to connect to RTMP server: {str(e)}")
+            LOG.error(f"Connection details - URL: {self.rtmp_url}, Width: {width}, Height: {height}, FPS: {fps}")
+            self.cleanup()
+            
+    def send_frame(self, bgr_frame):
+        if not self.connected:
+            return
+            
+        try:
+            # Convert BGR to RGB
+            rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+            
+            # Create AV frame
+            frame = av.VideoFrame.from_ndarray(rgb_frame, format='rgb24')
+            frame.pts = None  # Let the encoder handle timestamps
+            
+            # Encode and write frame
+            for packet in self.stream.encode(frame):
+                self.output.mux(packet)
+                
+        except Exception as e:
+            LOG.error(f"Failed to send frame to RTMP: {str(e)}")
+            LOG.error(f"Frame details - Shape: {bgr_frame.shape}")
+            self.cleanup()
+            
+    def cleanup(self):
+        if self.output:
+            try:
+                # Flush any remaining packets
+                if self.stream:
+                    for packet in self.stream.encode():
+                        self.output.mux(packet)
+                self.output.close()
+            except Exception as e:
+                LOG.error(f"Error during cleanup: {str(e)}")
+        self.output = None
+        self.stream = None
+        self.connected = False
+
+# Global RTMP manager instance
+_rtmp_manager = None
+
+def send_bgr_frame_to_rtmp(bgr_frame, fps=30, rtmp_url=None):
+    """Convert BGR frame to RTMP stream format and send to RTMP server.
+    
+    Args:
+        bgr_frame: numpy array in BGR format
+        fps: frames per second for the stream
+        rtmp_url: RTMP server URL to stream to
+    """
+    global _rtmp_manager
+    
+    try:
+        if _rtmp_manager is None:
+            if rtmp_url is None:
+                LOG.error("No RTMP URL provided for streaming")
+                return
+            _rtmp_manager = RTMPStreamManager(rtmp_url)
+            
+        if not _rtmp_manager.connected:
+            _rtmp_manager.connect(bgr_frame.shape[1], bgr_frame.shape[0], fps)
+            
+        _rtmp_manager.send_frame(bgr_frame)
+        
+    except Exception as e:
+        LOG.error(f"Failed in RTMP streaming: {str(e)}")
+        if _rtmp_manager:
+            _rtmp_manager.cleanup()
+            _rtmp_manager = None
+
+
 class _VideoWriter:
     def __init__(self, location, input):
         if isinstance(input, MultiplexPipeInput):
@@ -806,6 +933,8 @@ class _VideoWriter:
             ]
         bgr = image.asarray(types.ColorFormat.BGR)
         self._writer[stream_id].write(bgr)
+        # Send frame to RTMP
+        send_bgr_frame_to_rtmp(bgr, self._fps[stream_id] or 30)
 
     def release(self):
         for w in self._writer:
@@ -836,6 +965,9 @@ class PipeOutput:
         case the input must also be a single image and an error will be raised if the input stream
         includes more than once image.
 
+        6. A string starting with `rtmp://` in which case the output is streamed to an RTMP server.
+        The stream will be sent regardless of whether a file output is also specified.
+
     Output images/video will include the inference results overlaid on the original input image.
     '''
 
@@ -845,8 +977,14 @@ class PipeOutput:
         self._mode, self._parsed_location = _determine_output_mode(self.save_output)
         self._writer = _NullWriter()
         self._results = []
+        self._rtmp_url = self._parsed_location if self._mode == _OutputMode.RTMP else None
+        self._input_fps = 30  # Default FPS
 
     def initialize_writer(self, input: PipeInput):
+        # Store the input FPS for RTMP streaming
+        if hasattr(input, 'fps'):
+            self._input_fps = input.fps or 30
+            
         if self._mode == _OutputMode.IMAGES:
             self._parsed_location.parent.mkdir(parents=True, exist_ok=True)
             self._writer = _ImageWriter(self._parsed_location)
@@ -883,7 +1021,15 @@ class PipeOutput:
             for m in meta.values():
                 m.visit(lambda m: m.draw(draw))
             draw.draw()
-        self._writer.write(image, str(meta.image_id), frame_result.stream_id)
+        
+        # Always send to RTMP if URL is specified
+        if self._rtmp_url:
+            bgr = image.asarray(types.ColorFormat.BGR)
+            send_bgr_frame_to_rtmp(bgr, self._input_fps, self._rtmp_url)
+            
+        # Write to file if not RTMP-only mode
+        if self._mode != _OutputMode.RTMP:
+            self._writer.write(image, str(meta.image_id), frame_result.stream_id)
 
     def build_output_gst(self, gst: gst_builder.Builder, stream_count: int):
         qsize = gst.default_queue_max_size_buffers
